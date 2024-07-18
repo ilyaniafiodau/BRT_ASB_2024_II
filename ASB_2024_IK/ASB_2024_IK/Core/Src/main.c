@@ -30,6 +30,51 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+	ASB_RESET,                           
+	MANUAL_DRIVING_MODE,							
+	INIT_CHECK_REQUEST,
+	GO_SIGNAL,                          //	unused, yet
+	EXT_EMERGENCY,
+	EMERGENCY_HANDLER_ERROR,              // error that occurs when the Watchdog wasn't stopped
+	EMERGENCY_HANDLER_COMPLETE,
+	MONITORING_FINISHED,
+	MONITORING_ERROR,
+	INIT_CHECK_ERROR,
+	INIT_CHECK_COMPLETE,
+} ASBSignal_TypeDef; 
+ASBSignal_TypeDef ASBSignal;
+
+typedef enum {
+	NO_ERRORS = 0,
+	ENERGY_STORAGE_NOT_FILLED,
+	OVERPRESSURE_OR_IMPAUSIBILITY,
+	DRIVING_MODE_ERROR,
+	BRAKES_NOT_WORKING,
+	EBS_ENERGY_STORAGE_ERROR,
+	UNEXPECTED_SIGNAL_ERROR,
+} ErrorFlag_TypeDef;
+ErrorFlag_TypeDef ErrorFlag = NO_ERRORS;
+
+typedef enum {
+	AS_OFF = 0,
+	INIT_CHECK,
+	READY,
+	DRIVING,
+	EMERGENCY,
+	SAFE_STATE,
+} ASBState_TypeDef;
+ASBState_TypeDef ASBState = AS_OFF;
+
+// status(OFF=0x0, MANUAL=0x1, READY=0x2, DRIVING=0x3, EMERGENCY=0x4)
+typedef enum {
+	_OFF = 0,
+	_MANUAL,
+	_READY,
+	_DRIVING,
+	_EMERGENCY,
+} ASBStatus_TypeDef;
+ASBStatus_TypeDef ASBStatus = _OFF; 
 
 /* USER CODE END PTD */
 
@@ -40,10 +85,10 @@
 #define BRAKE_LIGHT_ON() HAL_GPIO_WritePin(BRAKE_LIGHT_SIGNAL_GPIO_Port,BRAKE_LIGHT_SIGNAL_Pin,GPIO_PIN_SET);
 #define BRAKE_LIGHT_OFF() HAL_GPIO_WritePin(BRAKE_LIGHT_SIGNAL_GPIO_Port,BRAKE_LIGHT_SIGNAL_Pin,GPIO_PIN_RESET);
 
-#define EBS_QM1_ON HAL_GPIO_WritePin(EBSActuator_GPIO_Port, EBSActuator_Pin, GPIO_PIN_SET);
-#define Redundant_QM2_ON HAL_GPIO_WritePin(RedundantActuator_GPIO_Port, RedundantActuator_Pin, GPIO_PIN_SET);
-#define EBS_QM1_OFF HAL_GPIO_WritePin(EBSActuator_GPIO_Port, EBSActuator_Pin, GPIO_PIN_RESET);
-#define Redundant_QM2_OFF HAL_GPIO_WritePin(RedundantActuator_GPIO_Port, RedundantActuator_Pin, GPIO_PIN_RESET);
+#define EBS_QM1_ON() HAL_GPIO_WritePin(EBSActuator_GPIO_Port, EBSActuator_Pin, GPIO_PIN_SET);
+#define Redundant_QM2_ON() HAL_GPIO_WritePin(RedundantActuator_GPIO_Port, RedundantActuator_Pin, GPIO_PIN_SET);
+#define EBS_QM1_OFF() HAL_GPIO_WritePin(EBSActuator_GPIO_Port, EBSActuator_Pin, GPIO_PIN_RESET);
+#define Redundant_QM2_OFF() HAL_GPIO_WritePin(RedundantActuator_GPIO_Port, RedundantActuator_Pin, GPIO_PIN_RESET);
 
 #define WD_READY_FALL_TIME 100  	// Time during which WD_is_ready is expected to fall, ms
 #define WD_READY_RISE_TIME 100	 	// Time during which WD_is_ready is expected to rise, ms
@@ -78,7 +123,7 @@ If the value coming from the sensor is less than PRESSURE_ZERO, the sensor does 
 
 #define PI 3.141592
 
-#define T 0.001; //sample time
+#define T 0.001; //sample time (discretization)
 
 #define k 4018.9f //коэффициент для пересчета давления в гидравлике(бар) в тормозной момент(Н*м)
 
@@ -125,9 +170,9 @@ float VAL_MomentBrake  = 0;
 /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Brake Moment~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
 
 /*~~~~~~~~~~~~~~~~PID value~~~~~~~~~~~~~~~~*/
-float outPIDpne = 0;
-float outPIDhyd = 0;
-float outPIDmoment = 0;
+static float outPIDpne = 0;
+static float outPIDhyd = 0;
+static float outPIDmoment = 0;
 float setPneumoValue = 0;
 float setHydroValue = 0;
 float setMomentValue = 0;
@@ -152,12 +197,14 @@ TIM_HandleTypeDef htim4;
 osThreadId readSensorsHandle;
 osThreadId supervisorHandle;
 osThreadId ManageSysTaskHandle;
+osThreadId SendCANTaskHandle;
 /* USER CODE BEGIN PV */
-CAN_TxHeaderTypeDef pTxHeader; 
+CAN_TxHeaderTypeDef pTxHeader;
 CAN_RxHeaderTypeDef pRxHeader;
 uint32_t TxMailbox;
 uint8_t i = 0;
 uint8_t recieve = 0;
+float transmit = 0;
 uint8_t TX_data[8], RX_data[8];
 CAN_FilterTypeDef sFilterConfig;
 /* USER CODE END PV */
@@ -172,6 +219,7 @@ static void MX_CAN1_Init(void);
 void StartReadSensorsTsk(void const * argument);
 void supervisorTask(void const * argument);
 void ManageTask(void const * argument);
+void SendControlCANTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -249,11 +297,65 @@ void BRAKE_LIGHT_FUNCTION(){ //функция свечения стопаря в
 	else if(VAL_BrakeSensRear_f <= 0.1f) {BRAKE_LIGHT_OFF();}
 }
 
-float PID_Controller(float setVal, float val, float up_lim, float low_lim, float Kp, float Ki, float Kd) { //PID-регулятор
-	float error_PID, error_PID_prev = 0;
-	float Prop, Int, Dif = 0;
-	float Int_prev = 0;
-	float out_PID = 0;
+float PID_Moment(float setVal, float val, float up_lim, float low_lim, float Kp, float Ki, float Kd) { //PID-регулятор
+	static float error_PID, error_PID_prev = 0;
+	static float Prop, Int, Dif = 0;
+	static float Int_prev = 0;
+	static float out_PID = 0;
+	/*--------вычисление ошибки регулирования--------*/
+	error_PID = setVal - val;
+
+	/*--------Пропорциональная составляющая--------*/
+	Prop = Kp * error_PID;
+
+	/*--------интегральная составляющая--------*/
+	Int = Int_prev + Ki * error_PID * T;
+
+	/*--------Дифференциальная составляющая--------*/
+	Dif = Kd * (error_PID - error_PID_prev) / T;
+
+	/*--------Обновление предыдущих значений--------*/
+	error_PID_prev = error_PID;
+	Int_prev = Int;
+
+	/*--------Выход PID регулятора--------*/
+	out_PID = Prop + Int + Dif;
+	out_PID = fminf(fmaxf(out_PID, low_lim), up_lim); //ограничиваем выход PID-регулятора
+  return out_PID;
+}
+
+float PID_Hydraulic(float setVal, float val, float up_lim, float low_lim, float Kp, float Ki, float Kd) { //PID-регулятор
+	static float error_PID, error_PID_prev = 0;
+	static float Prop, Int, Dif = 0;
+	static float Int_prev = 0;
+	static float out_PID = 0;
+	/*--------вычисление ошибки регулирования--------*/
+	error_PID = setVal - val;
+
+	/*--------Пропорциональная составляющая--------*/
+	Prop = Kp * error_PID;
+
+	/*--------интегральная составляющая--------*/
+	Int = Int_prev + Ki * error_PID * T;
+
+	/*--------Дифференциальная составляющая--------*/
+	Dif = Kd * (error_PID - error_PID_prev) / T;
+
+	/*--------Обновление предыдущих значений--------*/
+	error_PID_prev = error_PID;
+	Int_prev = Int;
+
+	/*--------Выход PID регулятора--------*/
+	out_PID = Prop + Int + Dif;
+	out_PID = fminf(fmaxf(out_PID, low_lim), up_lim); //ограничиваем выход PID-регулятора
+  return out_PID;
+}
+
+float PID_Pneumatic(float setVal, float val, float up_lim, float low_lim, float Kp, float Ki, float Kd) { //PID-регулятор
+	static float error_PID, error_PID_prev = 0;
+	static float Prop, Int, Dif = 0;
+	static float Int_prev = 0;
+	static float out_PID = 0;
 	/*--------вычисление ошибки регулирования--------*/
 	error_PID = setVal - val;
 
@@ -328,7 +430,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim4, Watchdog_Pin); //тактирование Watchdog
   HAL_ADCEx_Calibration_Start(&hadc1);     //калибруем АЦП
 	HAL_ADCEx_InjectedStart_IT(&hadc1);      //Запуск инжектированных каналов АЦП с прерыанием
-	//HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&adc, 4); // стартуем АЦП
+	HAL_DAC_Start(&hdac, DAC_CHANNEL_1);     //Запуск DAC
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -359,6 +461,10 @@ int main(void)
   /* definition and creation of ManageSysTask */
   osThreadDef(ManageSysTask, ManageTask, osPriorityNormal, 0, 256);
   ManageSysTaskHandle = osThreadCreate(osThread(ManageSysTask), NULL);
+
+  /* definition and creation of SendCANTask */
+  osThreadDef(SendCANTask, SendControlCANTask, osPriorityNormal, 0, 128);
+  SendCANTaskHandle = osThreadCreate(osThread(SendCANTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -719,12 +825,63 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
 	HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &pRxHeader, RX_data);
-	if(pRxHeader.StdId == 0x100){
-//		Temperature = RX_data[0];
+	if(pRxHeader.StdId == 0x300){
+		*(uint32_t*)&setMomentValue = *((uint32_t*)&RX_data[0]);
+	}
+	else if(pRxHeader.StdId == 0x301){
+		switch(RX_data[0]){
+			
+			case 0x00:
+				ASBSignal = ASB_RESET;
+			break;
+			
+			case 0x01:
+				ASBSignal = MANUAL_DRIVING_MODE;
+			break;
+			
+			case 0x02:
+				ASBSignal = INIT_CHECK_REQUEST;
+			break;
+			
+			case 0x03:
+				ASBSignal = EXT_EMERGENCY;
+			break;
+		}
+//		if(RX_data[0] == 0x00){
+//         currentASBSignal = ASB_Reset;	
+//		}
+//		if(RX_data[0] == 1){ 
+//				 currentASBSignal = Manual_Driving_Mode;
+//		}
+//		if(RX_data[0] == 2){ 
+//				 currentASBSignal = Init_Check_Request;
+//		}
+//		if (RX_data[0] == 3) {
+//				 currentASBSignal = Emergency_External;
+//				// emergencyHandler();
+//		}
 	}
 }
 void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef*hcan) {
 }
+
+void EmergencyHandler(void) {
+	ASBSignal_TypeDef someASBSignal;
+	
+  EBS_QM1_OFF();                                               // Disable EBS actuator (Turn OFF valve QM1)
+  
+	Redundant_QM2_OFF();                                         // Disable Redundant actuator (Turn OFF valve QM2)
+	
+	HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 0);  // Break pressure filled to Proportional valve
+	
+	SDC_OPEN();                                                  // AS opened SDC
+	
+	// Stop toggling watchdog => SDC will be opened
+	if (HAL_TIM_PWM_Stop(&htim4, Watchdog_Pin) != HAL_OK) {
+		someASBSignal = EMERGENCY_HANDLER_ERROR;
+	}
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartReadSensorsTsk */
@@ -741,8 +898,9 @@ void StartReadSensorsTsk(void const * argument)
   for(;;)
   {
 		SensorsRead();
-		VAL_BrakeSensFront_f = VAL_BrakeSensRear_f * 1.191f;//т.к. передний не работает
-		VAL_HydroPressure = VAL_BrakeSensRear_f + VAL_BrakeSensFront_f;
+		VAL_BrakeSensFront_f = VAL_BrakeSensRear_f * 1.191f;             //т.к. передний не работает
+		VAL_HydroPressure = VAL_BrakeSensRear_f + VAL_BrakeSensFront_f;  //суммарное давление в гидравлике
+		VAL_MomentBrake = VAL_HydroPressure * k;                         //считаем тормозной момент
 		BRAKE_LIGHT_FUNCTION();
     osDelay(1);
   }
@@ -762,6 +920,109 @@ void supervisorTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
+		switch (ASBState) {
+				case AS_OFF:
+					switch (ASBSignal) {
+						
+						case ASB_RESET:
+							break;
+						
+						case EXT_EMERGENCY:
+							break;
+						
+						case MANUAL_DRIVING_MODE:
+							break;
+						
+						case INIT_CHECK_REQUEST:
+							break;
+						
+						default:
+							break;
+					}
+					break;
+	
+				case INIT_CHECK:
+					switch (ASBSignal) {
+						
+						case EXT_EMERGENCY:
+							break;
+						
+						case INIT_CHECK_ERROR:
+							break;
+						
+						case INIT_CHECK_COMPLETE:
+							break;
+						
+						default:
+							break;
+					}
+					break;
+								
+				case READY:
+					switch (ASBSignal) {
+						
+						case EXT_EMERGENCY:
+							break;
+						
+						case ASB_RESET:
+							break;
+						
+						case MONITORING_ERROR:
+							break;
+						
+						case GO_SIGNAL:
+							break;
+						
+						default:
+							break;
+					}
+					break;
+					
+				case DRIVING:
+					switch (ASBSignal) {
+						case EXT_EMERGENCY:
+							break;
+						
+						case MONITORING_ERROR:
+							break;
+						
+						case MONITORING_FINISHED: // Which actions should be done in AS_FINISHED status?
+							break;
+						
+						default:
+							break;
+					}
+					break;
+					
+				case EMERGENCY:
+					switch (ASBSignal) {
+						
+						case EXT_EMERGENCY:
+							break;
+						
+						case EMERGENCY_HANDLER_ERROR:
+							break;
+						
+						case EMERGENCY_HANDLER_COMPLETE:
+							break;
+						
+						default:
+							break;
+					}
+					break;
+					
+				case SAFE_STATE:
+					switch (ASBSignal) {
+						
+						case ASB_RESET:
+//							HAL_NVIC_SystemReset();
+							break;
+						
+						default:
+							break;
+					}
+					break;
+			}
     osDelay(1);
   }
   /* USER CODE END supervisorTask */
@@ -780,13 +1041,35 @@ void ManageTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-//		setHydroValue = PID_Controller(setMomentValue, VAL_MomentBrake, 6000.0f, -6000.0f, 1.0f, 0, 0);
-//		setPneumoValue = PID_Controller(setHydroValue, VAL_HydroPressure, 22.0f, -22.0f, 1.0f, 0, 0);
-		outPIDpne = PID_Controller(setPneumoValue, VAL_Pressure_BP2_f, 8.0f, -8.0f, 1.0f, 0, 0);
-//		HAL_DAC_SetValue(outPIDpne);
+//		setHydroValue = PID_Moment(setMomentValue, VAL_MomentBrake, 6000.0f, -6000.0f, 1.0f, 0, 0);
+//		setPneumoValue = PID_Hydraulic(setHydroValue, VAL_HydroPressure, 22.0f, -22.0f, 1.0f, 0, 0);
+//		outPIDpne = PID_Pneumatic(setPneumoValue, VAL_Pressure_BP2_f, 8.0f, -8.0f, 1.0f, 0, 0);
+		DAC_voltageControl(outPIDpne);
     osDelay(1);
   }
   /* USER CODE END ManageTask */
+}
+
+/* USER CODE BEGIN Header_SendControlCANTask */
+/**
+* @brief Function implementing the SendCANTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_SendControlCANTask */
+void SendControlCANTask(void const * argument)
+{
+  /* USER CODE BEGIN SendControlCANTask */
+  /* Infinite loop */
+  for(;;)
+  {
+		transmit = VAL_MomentBrake;
+		*((uint32_t*)&TX_data[0]) = *(uint32_t*)&transmit;
+		TX_data[4] = ASBStatus;                                      // status(OFF=0x0, MANUAL=0x1, READY=0x2, DRIVING=0x3, EMERGENCY=0x4)
+		HAL_CAN_AddTxMessage(&hcan1,&pTxHeader,TX_data,&TxMailbox);  //отправка тормозного момента и статуса на VCDU
+    osDelay(10);
+  }
+  /* USER CODE END SendControlCANTask */
 }
 
 /**
